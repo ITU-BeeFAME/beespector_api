@@ -1,8 +1,3 @@
-# --- START OF beespector_api/README.md ---
-# Beespector API
-
-This is the backend API for the Beespector tool, built with FastAPI.
-
 ## Prerequisites
 
 - Python 3.7+
