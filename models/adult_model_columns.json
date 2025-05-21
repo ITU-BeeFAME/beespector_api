@@ -1,0 +1,36 @@
+{
+    "categorical_features": [
+        "workclass",
+        "education",
+        "marital_status",
+        "occupation",
+        "relationship",
+        "race",
+        "sex",
+        "native_country"
+    ],
+    "numerical_features": [
+        "age",
+        "fnlwgt",
+        "education_num",
+        "capital_gain",
+        "capital_loss",
+        "hours_per_week"
+    ],
+    "all_features_in_order": [
+        "workclass",
+        "education",
+        "marital_status",
+        "occupation",
+        "relationship",
+        "race",
+        "sex",
+        "native_country",
+        "age",
+        "fnlwgt",
+        "education_num",
+        "capital_gain",
+        "capital_loss",
+        "hours_per_week"
+    ]
+}
