@@ -1,4 +1,3 @@
-# --- START OF FULL REVISED main.py ---
 from typing import List, Dict, Any, Tuple
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
@@ -20,7 +19,7 @@ model_pipeline: Any = None
 model_columns_info: Dict[str, List[str]] = None
 initial_datapoints_cache: List[Dict[str, Any]] = []
 
-class StandardFeaturesModel(BaseModel): # Used for data internally and for JSON output
+class StandardFeaturesModel(BaseModel): 
     age: int
     workclass: str
     fnlwgt: int
@@ -33,14 +32,14 @@ class StandardFeaturesModel(BaseModel): # Used for data internally and for JSON 
     sex: str
     capital_gain: int
     capital_loss: int
-    hours_per_week: int = Field(serialization_alias="hours-per-week") # Python name, JSON output alias
-    native_country: str   # Python name, JSON output name (no alias needed if same)
-    klass: str = Field(serialization_alias="class") # Python name, JSON output alias
-    # model_config = ConfigDict(populate_by_name=True) # Not strictly needed if we control instantiation
+    hours_per_week: int = Field(serialization_alias="hours-per-week") 
+    native_country: str   
+    klass: str = Field(serialization_alias="class") 
+    
 
 class InitialDataPoint(BaseModel):
     id: int; x1: float; x2: float; true_label: int
-    features: StandardFeaturesModel # This will be serialized using StandardFeaturesModel's aliases
+    features: StandardFeaturesModel 
     pred_label: int; pred_prob: float
     mitigated_pred_label: int; mitigated_pred_prob: float
 
@@ -49,13 +48,13 @@ class EvaluatedPointPrediction(BaseModel):
 
 class EvaluatedPointData(BaseModel):
     id: int; x1: float; x2: float
-    features: StandardFeaturesModel # This will be serialized using StandardFeaturesModel's aliases
+    features: StandardFeaturesModel 
     true_label: int
     base_model_prediction: EvaluatedPointPrediction
     mitigated_model_prediction: EvaluatedPointPrediction
 
 def get_predictions(input_df: pd.DataFrame) -> Tuple[np.ndarray, np.ndarray]:
-    # ... (remains the same)
+
     if model_pipeline is None: raise RuntimeError("Model not loaded.")
     try:
         ordered_input_df = input_df[model_columns_info['all_features_in_order']]
@@ -68,7 +67,7 @@ def get_predictions(input_df: pd.DataFrame) -> Tuple[np.ndarray, np.ndarray]:
         return np.zeros(len(input_df), dtype=int), np.zeros(len(input_df), dtype=float)
 
 def simulate_mitigated_predictions(base_labels: np.ndarray, base_probs: np.ndarray, features_df: pd.DataFrame) -> Tuple[np.ndarray, np.ndarray]:
-    # ... (remains the same, with debug prints if you want)
+    
     print(f"DEBUG: Simulating mitigated predictions. Input base_probs: {base_probs.tolist()}")
     print(f"DEBUG: features_df for simulation (first row if multiple): \n{features_df.head(1)}")
     mitigated_probs = base_probs.copy()
@@ -128,13 +127,13 @@ async def startup_event():
         miti_labels, miti_probs = simulate_mitigated_predictions(base_labels, base_probs, features_for_pred_df.copy())
 
         x1_col, x2_col = 'age', 'hours_per_week'
-        # Ensure x1_col and x2_col are valid columns from the df_for_cache for scatter plot values
-        if x1_col not in df_for_cache.columns: x1_col = model_columns_info['all_features_in_order'][0] if model_columns_info['all_features_in_order'] else 'age' # Fallback
-        if x2_col not in df_for_cache.columns: x2_col = model_columns_info['all_features_in_order'][1] if len(model_columns_info['all_features_in_order']) > 1 else x1_col # Fallback
+        
+        if x1_col not in df_for_cache.columns: x1_col = model_columns_info['all_features_in_order'][0] if model_columns_info['all_features_in_order'] else 'age' 
+        if x2_col not in df_for_cache.columns: x2_col = model_columns_info['all_features_in_order'][1] if len(model_columns_info['all_features_in_order']) > 1 else x1_col 
         
         for i in range(len(df_for_cache)):
             row = df_for_cache.iloc[i]
-            # Construct features_dict with PYTHONIC keys, matching StandardFeaturesModel attributes
+            
             features_data_for_pydantic_model = {
                 "age": int(row["age"]),
                 "workclass": str(row["workclass"]),
@@ -148,20 +147,20 @@ async def startup_event():
                 "sex": str(row["sex"]),
                 "capital_gain": int(row["capital_gain"]),
                 "capital_loss": int(row["capital_loss"]),
-                "hours_per_week": int(row["hours_per_week"]), # Pythonic key
-                "native_country": str(row["native_country"]), # Pythonic key
-                "klass": str(row["workclass"])                  # Pythonic key
+                "hours_per_week": int(row["hours_per_week"]), 
+                "native_country": str(row["native_country"]), 
+                "klass": str(row["workclass"])                  
             }
-            # Basic NaN handling for string fields that might have come from row if not imputed before
+            
             for k, v_val in features_data_for_pydantic_model.items():
-                 if pd.isna(v_val): # Check specifically for string fields if they are expected
+                 if pd.isna(v_val): 
                     if k in ["workclass", "education", "marital_status", "occupation", "relationship", "race", "sex", "native_country", "klass"]:
                          features_data_for_pydantic_model[k] = "Unknown"
             
             initial_datapoints_cache.append(dict(
                 id=int(row['id']), x1=float(row[x1_col]), x2=float(row[x2_col]),
                 true_label=int(row['target']),
-                features=features_data_for_pydantic_model, # This dict has Pythonic keys
+                features=features_data_for_pydantic_model,
                 pred_label=int(base_labels[i]), pred_prob=float(base_probs[i]),
                 mitigated_pred_label=int(miti_labels[i]), mitigated_pred_prob=float(miti_probs[i])
             ))
@@ -174,16 +173,10 @@ app.add_middleware(CORSMiddleware, allow_origins=["http://localhost:3000", "http
 async def get_all_datapoints():
     if not initial_datapoints_cache: return {"data": []}
     try:
-        # InitialDataPoint will instantiate StandardFeaturesModel for its 'features' field.
-        # It uses the dict `dp['features']` (which has Pythonic keys).
-        # StandardFeaturesModel is instantiated using these Pythonic keys.
-        # The response_model then SERIALIZES InitialDataPoint. During serialization,
-        # StandardFeaturesModel's Field(serialization_alias=...) will ensure JSON keys
-        # like "hours-per-week" and "class" are used.
         return {"data": [InitialDataPoint(**dp) for dp in initial_datapoints_cache]}
     except Exception as e: print(f"Error creating InitialDataPoint instances for response: {e}"); raise HTTPException(500, "Error processing data for API response")
 
-# For parsing the PUT request body from the frontend
+
 class FeaturesPayload(BaseModel):
     age: int
     workclass: str
@@ -197,15 +190,15 @@ class FeaturesPayload(BaseModel):
     sex: str
     capital_gain: int
     capital_loss: int
-    # Expect aliased keys from JSON, map them to Pythonic attributes
+    
     hours_per_week: int = Field(validation_alias="hours-per-week")
-    native_country: str # Frontend sends 'native_country' (matches Python name)
+    native_country: str 
     klass: str = Field(validation_alias="class")
     model_config = ConfigDict(populate_by_name=True)
 
 class UpdatePointPayload(BaseModel):
     x1: float; x2: float
-    features: FeaturesPayload # Use FeaturesPayload for parsing
+    features: FeaturesPayload 
     model_config = ConfigDict(populate_by_name=True)
 
 @app.put("/api/datapoints/{point_id}/evaluate", response_model=EvaluatedPointData)
@@ -215,15 +208,11 @@ async def evaluate_modified_point(point_id: int, payload: UpdatePointPayload):
     if original_row.empty: raise HTTPException(404, "Point ID not found.")
     true_label = int(original_row.iloc[0]['target'])
 
-    # payload.features is an instance of FeaturesPayload.
-    # Its attributes (e.g. payload.features.hours_per_week) are Pythonic names,
-    # correctly parsed from JSON thanks to validation_alias.
-    # For prediction, we need a DataFrame with Pythonic column names.
-    features_for_df_dict = payload.features.model_dump(by_alias=False) # Get dict with Pythonic field names
+    features_for_df_dict = payload.features.model_dump(by_alias=False) 
     input_features_df = pd.DataFrame([features_for_df_dict])
     
-    input_features_df = input_features_df[model_columns_info['all_features_in_order']] # Reorder
-    for col in input_features_df.columns: # NaN handling
+    input_features_df = input_features_df[model_columns_info['all_features_in_order']] 
+    for col in input_features_df.columns: 
         if input_features_df[col].isnull().sum() > 0:
             if pd.api.types.is_numeric_dtype(input_features_df[col]): fill_value = dataset_df[col].median()
             else: fill_value = dataset_df[col].mode()[0] if not input_features_df[col].mode().empty else "Unknown"
@@ -232,10 +221,6 @@ async def evaluate_modified_point(point_id: int, payload: UpdatePointPayload):
     base_labels, base_probs = get_predictions(input_features_df)
     miti_labels, miti_probs = simulate_mitigated_predictions(base_labels, base_probs, input_features_df.copy())
 
-    # For the response, we need to provide a StandardFeaturesModel instance.
-    # payload.features is FeaturesPayload. We can convert it or ensure compatibility.
-    # Since StandardFeaturesModel and FeaturesPayload attributes are now aligned (Pythonic),
-    # we can instantiate StandardFeaturesModel from features_for_df_dict.
     response_features_model = StandardFeaturesModel(**features_for_df_dict)
 
     return EvaluatedPointData(
@@ -251,4 +236,3 @@ async def get_partial_dependence(): return {"partial_dependence_data": []}
 async def get_performance_fairness(): return { "roc_curve": [], "pr_curve": [], "confusion_matrix": {"tn": 0, "fp": 0, "fn": 0, "tp": 0}, "fairness_metrics": {"StatisticalParityDiff": 0, "DisparateImpact": 0, "EqualOpportunityDiff": 0}, "performance_metrics": {"Accuracy": 0, "F1Score": 0, "AUC": 0}}
 @app.get("/api/features")
 async def get_features(): return {"features": []}
-# --- END OF FINAL REVIEWED main.py ---
