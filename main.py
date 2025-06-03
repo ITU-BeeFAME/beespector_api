@@ -1,244 +1,706 @@
-from typing import List, Dict, Any, Tuple
+from typing import List, Dict, Any, Tuple, Optional
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field, ConfigDict
 import pandas as pd
+import numpy as np
 import joblib
 import os
 import json
-import numpy as np
+from sklearn.model_selection import train_test_split
+from sklearn.impute import SimpleImputer
+from sklearn.preprocessing import StandardScaler, OneHotEncoder
+from sklearn.compose import ColumnTransformer
+from sklearn.pipeline import Pipeline
+from sklearn.linear_model import LogisticRegression
+from sklearn.tree import DecisionTreeClassifier
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.metrics import roc_curve, precision_recall_curve, confusion_matrix
+from sklearn.inspection import partial_dependence
+import logging
 
-DATA_DIR = "data"
-MODEL_DIR = "models"
-DATA_FILE = os.path.join(DATA_DIR, "adult.csv")
-MODEL_FILE = os.path.join(MODEL_DIR, "base_adult_logistic_model.pkl")
-COLUMNS_FILE = os.path.join(MODEL_DIR, "adult_model_columns.json")
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
-dataset_df: pd.DataFrame = None
-model_pipeline: Any = None
-model_columns_info: Dict[str, List[str]] = None
-initial_datapoints_cache: List[Dict[str, Any]] = []
+#global state for current context
+class BeespectorContext:
+    def __init__(self):
+        self.dataset_df: Optional[pd.DataFrame] = None
+        self.X_train: Optional[pd.DataFrame] = None
+        self.X_test: Optional[pd.DataFrame] = None
+        self.y_train: Optional[pd.Series] = None
+        self.y_test: Optional[pd.Series] = None
+        self.base_model: Optional[Any] = None
+        self.mitigated_model: Optional[Any] = None
+        self.feature_columns: List[str] = []
+        self.categorical_features: List[str] = []
+        self.numerical_features: List[str] = []
+        self.target_column: str = ""
+        self.dataset_name: str = ""
+        self.base_classifier_type: str = ""
+        self.mitigation_method: str = ""
+        self.sensitive_feature: str = ""
+        self.x1_feature: str = "age"
+        self.x2_feature: str = "hours_per_week"
+        self.preprocessor: Optional[Any] = None
+        self.is_initialized: bool = False
 
-class StandardFeaturesModel(BaseModel): 
-    age: int
-    workclass: str
-    fnlwgt: int
-    education: str
-    education_num: int
-    marital_status: str
-    occupation: str
-    relationship: str
-    race: str
-    sex: str
-    capital_gain: int
-    capital_loss: int
-    hours_per_week: int = Field(serialization_alias="hours-per-week") 
-    native_country: str   
-    klass: str = Field(serialization_alias="class") 
-    
+context = BeespectorContext()
+
+
+class InitializeContextRequest(BaseModel):
+    dataset_name: str
+    base_classifier: str
+    classifier_params: Dict[str, Any] = {}
+    mitigation_method: str
+    mitigation_params: Dict[str, Any] = {}
+    sensitive_feature: str
+    x1_feature: Optional[str] = None
+    x2_feature: Optional[str] = None
+
+class StandardFeaturesModel(BaseModel):
+    model_config = ConfigDict(extra='allow')
 
 class InitialDataPoint(BaseModel):
-    id: int; x1: float; x2: float; true_label: int
-    features: StandardFeaturesModel 
-    pred_label: int; pred_prob: float
-    mitigated_pred_label: int; mitigated_pred_prob: float
+    id: int
+    x1: float
+    x2: float
+    true_label: int
+    features: Dict[str, Any]
+    pred_label: int
+    pred_prob: float
+    mitigated_pred_label: int
+    mitigated_pred_prob: float
 
 class EvaluatedPointPrediction(BaseModel):
-    pred_label: int; pred_prob: float
+    pred_label: int
+    pred_prob: float
 
 class EvaluatedPointData(BaseModel):
-    id: int; x1: float; x2: float
-    features: StandardFeaturesModel 
+    id: int
+    x1: float
+    x2: float
+    features: Dict[str, Any]
     true_label: int
     base_model_prediction: EvaluatedPointPrediction
     mitigated_model_prediction: EvaluatedPointPrediction
 
-def get_predictions(input_df: pd.DataFrame) -> Tuple[np.ndarray, np.ndarray]:
+class FeatureStats(BaseModel):
+    featureName: str
+    count: int
+    missing: int
+    mean: float
+    min: float
+    max: float
+    median: float
+    std: float
+    histogram: List[Dict[str, Any]]
 
-    if model_pipeline is None: raise RuntimeError("Model not loaded.")
-    try:
-        ordered_input_df = input_df[model_columns_info['all_features_in_order']]
-        pred_probs_all_classes = model_pipeline.predict_proba(ordered_input_df)
-        pred_probs_positive_class = pred_probs_all_classes[:, 1]
-        pred_labels = model_pipeline.predict(ordered_input_df)
-        return pred_labels, pred_probs_positive_class
-    except Exception as e:
-        print(f"Error during prediction: {e}")
-        return np.zeros(len(input_df), dtype=int), np.zeros(len(input_df), dtype=float)
 
-def simulate_mitigated_predictions(base_labels: np.ndarray, base_probs: np.ndarray, features_df: pd.DataFrame) -> Tuple[np.ndarray, np.ndarray]:
+def load_dataset(dataset_name: str) -> pd.DataFrame:
+    """Load dataset based on name. In production, this would fetch from BeeFAME's data source."""
     
-    print(f"DEBUG: Simulating mitigated predictions. Input base_probs: {base_probs.tolist()}")
-    print(f"DEBUG: features_df for simulation (first row if multiple): \n{features_df.head(1)}")
-    mitigated_probs = base_probs.copy()
-    sex_col = 'sex'; race_col = 'race'
-    if sex_col in features_df.columns:
-        female_condition = features_df[sex_col].astype(str).str.strip().str.lower() == 'female'
-        if np.any(female_condition):
-            print(f"DEBUG: Found {np.sum(female_condition)} 'Female' entries for sex-based mitigation.")
-            mitigated_probs[female_condition] = np.clip(mitigated_probs[female_condition] * 0.9, 0.01, 0.99)
-    else: print(f"DEBUG: '{sex_col}' column not found in features_df for simulation. Columns: {features_df.columns.tolist()}")
-    if race_col in features_df.columns:
-        black_condition = features_df[race_col].astype(str).str.strip().str.lower() == 'black'
-        if np.any(black_condition):
-            print(f"DEBUG: Found {np.sum(black_condition)} 'Black' entries for race-based mitigation.")
-            mitigated_probs[black_condition] = np.clip(mitigated_probs[black_condition] * 1.1, 0.01, 0.99)
-    else: print(f"DEBUG: '{race_col}' column not found in features_df for simulation. Columns: {features_df.columns.tolist()}")
-    mitigated_labels = (mitigated_probs > 0.5).astype(int)
-    print(f"DEBUG: Output mitigated_probs: {mitigated_probs.tolist()}, mitigated_labels: {mitigated_labels.tolist()}")
-    return mitigated_labels, np.round(mitigated_probs, 3)
+    if dataset_name.lower() == "adult":
+        data_file = os.path.join("data", "adult.csv")
+        if not os.path.exists(data_file):
+            raise ValueError(f"Dataset file not found: {data_file}")
+        
+        df = pd.read_csv(data_file)
+        
+        
+        df = df.replace('?', np.nan)
+        
+        
+        df.columns = df.columns.str.strip().str.replace('-', '_', regex=False).str.replace('.', '_', regex=False)
+        
+        
+        logger.info(f"Dataset columns after standardization: {df.columns.tolist()}")
+        
+        
+        target_candidates = ['income_per_year', 'income', 'class', 'target']
+        target_col = None
+        for col in target_candidates:
+            if col in df.columns:
+                target_col = col
+                break
+        
+        if not target_col:
+            raise ValueError("Target column not found in dataset")
+        
+        df['target'] = df[target_col].apply(lambda x: 1 if str(x).strip() == '>50K' else 0)
+        if target_col != 'target':
+            df = df.drop(columns=[target_col])
+        
+        
+        df = df.dropna(subset=['target'])
+        
+        return df
+    else:
+        raise ValueError(f"Unsupported dataset: {dataset_name}")
+
+def get_feature_types(df: pd.DataFrame, target_col: str) -> Tuple[List[str], List[str]]:
+    """Identify categorical and numerical features."""
+    features = [col for col in df.columns if col != target_col and col != 'id']
+    
+    categorical = []
+    numerical = []
+    
+    for col in features:
+        if df[col].dtype in ['int64', 'float64', 'int32', 'float32']:
+
+            if df[col].nunique() < 10:
+                categorical.append(col)
+            else:
+                numerical.append(col)
+        else:
+            categorical.append(col)
+    
+    logger.info(f"Categorical features: {categorical}")
+    logger.info(f"Numerical features: {numerical}")
+    
+    return categorical, numerical
+
+def create_preprocessor(categorical_features: List[str], numerical_features: List[str]):
+    """Create preprocessing pipeline."""
+    
+    
+    numerical_pipeline = Pipeline([
+        ('imputer', SimpleImputer(strategy='median')),
+        ('scaler', StandardScaler())
+    ])
+    
+    
+    categorical_pipeline = Pipeline([
+        ('imputer', SimpleImputer(strategy='constant', fill_value='Unknown')),
+        ('onehot', OneHotEncoder(drop='first', sparse_output=False, handle_unknown='ignore'))
+    ])
+    
+    preprocessor = ColumnTransformer(
+        transformers=[
+            ('num', numerical_pipeline, numerical_features),
+            ('cat', categorical_pipeline, categorical_features)
+        ])
+    
+    return preprocessor
+
+def train_base_model(X_train: pd.DataFrame, y_train: pd.Series, 
+                    classifier_type: str, params: Dict[str, Any],
+                    preprocessor: Any) -> Pipeline:
+    """Train base classifier."""
+    if classifier_type.lower() == "logistic_regression":
+        classifier = LogisticRegression(random_state=34, max_iter=1000, **params)
+    elif classifier_type.lower() == "decision_tree":
+        classifier = DecisionTreeClassifier(random_state=53, **params)
+    elif classifier_type.lower() == "random_forest":
+        classifier = RandomForestClassifier(random_state=61, **params)
+    else:
+        raise ValueError(f"Unsupported classifier: {classifier_type}")
+    
+    pipeline = Pipeline([
+        ('preprocessor', preprocessor),
+        ('classifier', classifier)
+    ])
+    
+    pipeline.fit(X_train, y_train)
+    return pipeline
+
+def apply_mitigation(base_model: Pipeline, X_train: pd.DataFrame, y_train: pd.Series,
+                    mitigation_method: str, sensitive_feature: str, 
+                    mitigation_params: Dict[str, Any]) -> Pipeline:
+    """Apply fairness mitigation. For now, returns a simulated mitigated model."""
+    
+    if mitigation_method.lower() == "reweighing":
+        weights = np.ones(len(y_train))
+        
+        
+        if sensitive_feature in X_train.columns:
+            sensitive_values = X_train[sensitive_feature]
+            for idx, (val, label) in enumerate(zip(sensitive_values, y_train)):
+                if (val == 'Female' and label == 1) or (val == 'Male' and label == 0):
+                    weights[idx] = 1.2
+        
+        
+        mitigated_classifier = type(base_model.named_steps['classifier'])(
+            **base_model.named_steps['classifier'].get_params()
+        )
+        
+        mitigated_pipeline = Pipeline([
+            ('preprocessor', base_model.named_steps['preprocessor']),
+            ('classifier', mitigated_classifier)
+        ])
+        
+        mitigated_pipeline.fit(X_train, y_train, classifier__sample_weight=weights)
+        return mitigated_pipeline
+    else:
+        return base_model
+
+def get_predictions(model: Pipeline, X: pd.DataFrame) -> Tuple[np.ndarray, np.ndarray]:
+    """Get predictions and probabilities from model."""
+    try:
+        pred_labels = model.predict(X)
+        pred_probs = model.predict_proba(X)[:, 1]
+        return pred_labels, pred_probs
+    except Exception as e:
+        logger.error(f"Error during prediction: {e}")
+        return np.zeros(len(X)), np.zeros(len(X))
 
 
-app = FastAPI(title="Beespector API")
+app = FastAPI(title="Beespector API - Dynamic")
 
 app.add_middleware(
-    CORSMiddleware, 
-    allow_origins=["http://localhost:3000", "http://localhost:3001", "http://127.0.0.1:3000", "http://127.0.0.1:3001"], 
-    allow_credentials=True, 
-    allow_methods=["*"], 
+    CORSMiddleware,
+    allow_origins=["*"],  
+    allow_credentials=True,
+    allow_methods=["*"],
     allow_headers=["*"]
 )
 
-@app.on_event("startup")
-async def startup_event():
-    global dataset_df, model_pipeline, model_columns_info, initial_datapoints_cache
-    print("Loading dataset and model at startup...")
+@app.post("/api/initialize_context")
+async def initialize_context(request: InitializeContextRequest):
+    """Initialize Beespector with dataset and models based on parameters."""
+    global context
+    
     try:
-        temp_df = pd.read_csv(DATA_FILE)
-        temp_df.columns = temp_df.columns.str.strip().str.replace('-', '_', regex=False).str.replace('.', '_', regex=False)
-        actual_target_col = None
-        possible_targets = ['income_per_year', 'income', 'class', 'target']
-        for ct_name in possible_targets:
-            if ct_name in temp_df.columns: actual_target_col = ct_name; break
-        if not actual_target_col: raise ValueError(f"Target column not found. Checked: {possible_targets}")
-        print(f"Using target column: {actual_target_col}")
-        temp_df['target'] = temp_df[actual_target_col].apply(lambda x: 1 if str(x).strip() == '>50K' else 0)
-        dataset_df = temp_df.drop(columns=[actual_target_col])
-        dataset_df = dataset_df.reset_index().rename(columns={'index': 'id'})
-        with open(COLUMNS_FILE, 'r') as f: model_columns_info = json.load(f)
-        if 'all_features_in_order' not in model_columns_info: raise ValueError(f"Key 'all_features_in_order' missing in {COLUMNS_FILE}")
-        model_pipeline = joblib.load(MODEL_FILE)
-        print("Model loaded successfully.")
-
-        SAMPLE_SIZE_FOR_CACHE = 200
-        df_for_cache = dataset_df.sample(n=min(SAMPLE_SIZE_FOR_CACHE, len(dataset_df)), random_state=42).copy().reset_index(drop=True)
-        print(f"Processing {len(df_for_cache)} sampled points for initial cache.")
+        logger.info(f"Initializing context with dataset: {request.dataset_name}")
         
-        features_for_pred_df = df_for_cache[model_columns_info['all_features_in_order']].copy()
-        for col in features_for_pred_df.columns:
-            if features_for_pred_df[col].isnull().sum() > 0:
-                if pd.api.types.is_numeric_dtype(features_for_pred_df[col]): fill_value = features_for_pred_df[col].median()
-                else: fill_value = features_for_pred_df[col].mode()[0] if not features_for_pred_df[col].mode().empty else "Unknown"
-                features_for_pred_df[col] = features_for_pred_df[col].fillna(fill_value)
-
-        base_labels, base_probs = get_predictions(features_for_pred_df)
-        miti_labels, miti_probs = simulate_mitigated_predictions(base_labels, base_probs, features_for_pred_df.copy())
-
-        x1_col, x2_col = 'age', 'hours_per_week'
         
-        if x1_col not in df_for_cache.columns: x1_col = model_columns_info['all_features_in_order'][0] if model_columns_info['all_features_in_order'] else 'age' 
-        if x2_col not in df_for_cache.columns: x2_col = model_columns_info['all_features_in_order'][1] if len(model_columns_info['all_features_in_order']) > 1 else x1_col 
+        df = load_dataset(request.dataset_name)
+        context.dataset_df = df.copy()
+        context.dataset_name = request.dataset_name
         
-        for i in range(len(df_for_cache)):
-            row = df_for_cache.iloc[i]
+        
+        context.target_column = 'target'
+        context.feature_columns = [col for col in df.columns if col not in ['target', 'id']]
+        
+        
+        numerical_cols = [col for col in context.feature_columns if df[col].dtype in ['int64', 'float64']]
+        logger.info(f"Numerical columns found: {numerical_cols}")
+        
+        if request.x1_feature and request.x1_feature in numerical_cols:
+            context.x1_feature = request.x1_feature
+        else:
             
-            features_data_for_pydantic_model = {
-                "age": int(row["age"]),
-                "workclass": str(row["workclass"]),
-                "fnlwgt": int(row["fnlwgt"]),
-                "education": str(row["education"]),
-                "education_num": int(row["education_num"]),
-                "marital_status": str(row["marital_status"]),
-                "occupation": str(row["occupation"]),
-                "relationship": str(row["relationship"]),
-                "race": str(row["race"]),
-                "sex": str(row["sex"]),
-                "capital_gain": int(row["capital_gain"]),
-                "capital_loss": int(row["capital_loss"]),
-                "hours_per_week": int(row["hours_per_week"]), 
-                "native_country": str(row["native_country"]), 
-                "klass": str(row["workclass"])                  
-            }
+            if 'age' in numerical_cols:
+                context.x1_feature = 'age'
+            elif len(numerical_cols) > 0:
+                context.x1_feature = numerical_cols[0]
+            else:
+                raise ValueError("No numerical features found for x1")
+                
+        if request.x2_feature and request.x2_feature in numerical_cols:
+            context.x2_feature = request.x2_feature
+        else:
             
-            for k, v_val in features_data_for_pydantic_model.items():
-                 if pd.isna(v_val): 
-                    if k in ["workclass", "education", "marital_status", "occupation", "relationship", "race", "sex", "native_country", "klass"]:
-                         features_data_for_pydantic_model[k] = "Unknown"
-            
-            initial_datapoints_cache.append(dict(
-                id=int(row['id']), x1=float(row[x1_col]), x2=float(row[x2_col]),
-                true_label=int(row['target']),
-                features=features_data_for_pydantic_model,
-                pred_label=int(base_labels[i]), pred_prob=float(base_probs[i]),
-                mitigated_pred_label=int(miti_labels[i]), mitigated_pred_prob=float(miti_probs[i])
-            ))
-        print(f"Initial cache populated with {len(initial_datapoints_cache)} points.")
-    except Exception as e: print(f"FATAL STARTUP ERROR: {e}"); import traceback; traceback.print_exc()
+            if 'hours_per_week' in numerical_cols:
+                context.x2_feature = 'hours_per_week'
+            elif len(numerical_cols) > 1:
+                context.x2_feature = numerical_cols[1]
+            else:
+                context.x2_feature = context.x1_feature  
+        
+        logger.info(f"Using x1_feature: {context.x1_feature}, x2_feature: {context.x2_feature}")
+        
+        
+        if 'id' not in df.columns:
+            df = df.reset_index().rename(columns={'index': 'id'})
+        
+        X = df[context.feature_columns]
+        y = df[context.target_column]
+        
+        
+        X_train, X_test, y_train, y_test = train_test_split(
+            X, y, test_size=0.2, random_state=11, stratify=y
+        )
+        
+        context.X_train = X_train
+        context.X_test = X_test
+        context.y_train = y_train
+        context.y_test = y_test
+        
+       
+        context.categorical_features, context.numerical_features = get_feature_types(X, context.target_column)
+        
+        
+        context.preprocessor = create_preprocessor(
+            context.categorical_features, 
+            context.numerical_features
+        )
+        
+        
+        context.base_model = train_base_model(
+            X_train, y_train,
+            request.base_classifier,
+            request.classifier_params,
+            context.preprocessor
+        )
+        context.base_classifier_type = request.base_classifier
+        
+        
+        context.mitigated_model = apply_mitigation(
+            context.base_model,
+            X_train, y_train,
+            request.mitigation_method,
+            request.sensitive_feature,
+            request.mitigation_params
+        )
+        context.mitigation_method = request.mitigation_method
+        context.sensitive_feature = request.sensitive_feature
+        
+        context.is_initialized = True
+        
+        return {
+            "status": "success",
+            "message": "Context initialized successfully",
+            "dataset": context.dataset_name,
+            "n_samples": len(df),
+            "n_features": len(context.feature_columns),
+            "base_classifier": context.base_classifier_type,
+            "mitigation_method": context.mitigation_method
+        }
+        
+    except Exception as e:
+        logger.error(f"Error initializing context: {str(e)}")
+        context.is_initialized = False
+        raise HTTPException(status_code=500, detail=str(e))
 
 @app.get("/api/datapoints", response_model=Dict[str, List[InitialDataPoint]])
 async def get_all_datapoints():
-    if not initial_datapoints_cache: return {"data": []}
-    try:
-        return {"data": [InitialDataPoint(**dp) for dp in initial_datapoints_cache]}
-    except Exception as e: print(f"Error creating InitialDataPoint instances for response: {e}"); raise HTTPException(500, "Error processing data for API response")
-
-
-class FeaturesPayload(BaseModel):
-    age: int
-    workclass: str
-    fnlwgt: int
-    education: str
-    education_num: int
-    marital_status: str
-    occupation: str
-    relationship: str
-    race: str
-    sex: str
-    capital_gain: int
-    capital_loss: int
+    """Get sample of datapoints with predictions from both models."""
+    if not context.is_initialized:
+        raise HTTPException(status_code=400, detail="Context not initialized. Call /api/initialize_context first.")
     
-    hours_per_week: int = Field(validation_alias="hours-per-week")
-    native_country: str 
-    klass: str = Field(validation_alias="class")
-    model_config = ConfigDict(populate_by_name=True)
-
-class UpdatePointPayload(BaseModel):
-    x1: float; x2: float
-    features: FeaturesPayload 
-    model_config = ConfigDict(populate_by_name=True)
+    try:
+        
+        sample_size = min(50, len(context.X_test))
+        sample_indices = np.random.choice(context.X_test.index, size=sample_size, replace=False)
+        
+        X_sample = context.X_test.loc[sample_indices]
+        y_sample = context.y_test.loc[sample_indices]
+        
+       
+        base_labels, base_probs = get_predictions(context.base_model, X_sample)
+        mit_labels, mit_probs = get_predictions(context.mitigated_model, X_sample)
+        
+        
+        datapoints = []
+        for i, (idx, row) in enumerate(X_sample.iterrows()):
+            features_dict = {}
+            
+            
+            for col, val in row.items():
+                if pd.isna(val) or (isinstance(val, float) and np.isinf(val)):
+                    
+                    if col in context.numerical_features:
+                        features_dict[col] = 0.0
+                    else:
+                        features_dict[col] = "Unknown"
+                else:
+                   
+                    if isinstance(val, (np.integer, np.int64, np.int32)):
+                        features_dict[col] = int(val)
+                    elif isinstance(val, (np.floating, np.float64, np.float32)):
+                        features_dict[col] = float(val)
+                    else:
+                        features_dict[col] = str(val)
+            
+            
+            try:
+                x1_val = float(row[context.x1_feature]) if context.x1_feature in row and pd.notna(row[context.x1_feature]) else 0.0
+                if np.isnan(x1_val) or np.isinf(x1_val):
+                    x1_val = 0.0
+            except (ValueError, TypeError):
+                logger.warning(f"Could not convert x1 feature '{context.x1_feature}' value '{row.get(context.x1_feature)}' to float")
+                x1_val = 0.0
+                
+            try:
+                x2_val = float(row[context.x2_feature]) if context.x2_feature in row and pd.notna(row[context.x2_feature]) else 0.0
+                if np.isnan(x2_val) or np.isinf(x2_val):
+                    x2_val = 0.0
+            except (ValueError, TypeError):
+                logger.warning(f"Could not convert x2 feature '{context.x2_feature}' value '{row.get(context.x2_feature)}' to float")
+                x2_val = 0.0
+            
+            
+            pred_prob = float(base_probs[i])
+            mit_prob = float(mit_probs[i])
+            
+            if np.isnan(pred_prob) or np.isinf(pred_prob):
+                pred_prob = 0.5
+            if np.isnan(mit_prob) or np.isinf(mit_prob):
+                mit_prob = 0.5
+            
+            datapoint = InitialDataPoint(
+                id=int(idx),
+                x1=x1_val,
+                x2=x2_val,
+                true_label=int(y_sample.loc[idx]),
+                features=features_dict,
+                pred_label=int(base_labels[i]),
+                pred_prob=pred_prob,
+                mitigated_pred_label=int(mit_labels[i]),
+                mitigated_pred_prob=mit_prob
+            )
+            datapoints.append(datapoint)
+        
+        return {"data": datapoints}
+        
+    except Exception as e:
+        logger.error(f"Error getting datapoints: {str(e)}")
+        import traceback
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=str(e))
 
 @app.put("/api/datapoints/{point_id}/evaluate", response_model=EvaluatedPointData)
-async def evaluate_modified_point(point_id: int, payload: UpdatePointPayload):
-    if not model_pipeline: raise HTTPException(503, "Model not ready.")
-    original_row = dataset_df[dataset_df['id'] == point_id]
-    if original_row.empty: raise HTTPException(404, "Point ID not found.")
-    true_label = int(original_row.iloc[0]['target'])
-
-    features_for_df_dict = payload.features.model_dump(by_alias=False) 
-    input_features_df = pd.DataFrame([features_for_df_dict])
+async def evaluate_modified_point(point_id: int, payload: Dict[str, Any]):
+    """Evaluate modified point with both models."""
+    if not context.is_initialized:
+        raise HTTPException(status_code=400, detail="Context not initialized.")
     
-    input_features_df = input_features_df[model_columns_info['all_features_in_order']] 
-    for col in input_features_df.columns: 
-        if input_features_df[col].isnull().sum() > 0:
-            if pd.api.types.is_numeric_dtype(input_features_df[col]): fill_value = dataset_df[col].median()
-            else: fill_value = dataset_df[col].mode()[0] if not input_features_df[col].mode().empty else "Unknown"
-            input_features_df[col] = input_features_df[col].fillna(fill_value)
+    try:
+        
+        x1 = payload.get('x1', 0)
+        x2 = payload.get('x2', 0)
+        features = payload.get('features', {})
+        
+        
+        feature_data = {}
+        for col in context.feature_columns:
+            if col == context.x1_feature:
+                feature_data[col] = x1
+            elif col == context.x2_feature:
+                feature_data[col] = x2
+            else:
+                val = features.get(col, 0)
+               
+                if pd.isna(val) or (isinstance(val, float) and np.isinf(val)):
+                    if col in context.numerical_features:
+                        feature_data[col] = 0
+                    else:
+                        feature_data[col] = "Unknown"
+                else:
+                    feature_data[col] = val
+        
+        X_point = pd.DataFrame([feature_data])
+        
+        
+        base_labels, base_probs = get_predictions(context.base_model, X_point)
+        mit_labels, mit_probs = get_predictions(context.mitigated_model, X_point)
+        
+       
+        true_label = 0
+        if point_id in context.dataset_df.index:
+            true_label = int(context.dataset_df.loc[point_id, 'target'])
+        
+        
+        clean_features = {}
+        for k, v in features.items():
+            if pd.isna(v) or (isinstance(v, float) and np.isinf(v)):
+                if k in context.numerical_features:
+                    clean_features[k] = 0.0
+                else:
+                    clean_features[k] = "Unknown"
+            else:
+                if isinstance(v, (np.integer, np.int64, np.int32)):
+                    clean_features[k] = int(v)
+                elif isinstance(v, (np.floating, np.float64, np.float32)):
+                    clean_features[k] = float(v)
+                else:
+                    clean_features[k] = str(v)
+        
+        
+        base_prob = float(base_probs[0])
+        mit_prob = float(mit_probs[0])
+        
+        if np.isnan(base_prob) or np.isinf(base_prob):
+            base_prob = 0.5
+        if np.isnan(mit_prob) or np.isinf(mit_prob):
+            mit_prob = 0.5
+        
+        return EvaluatedPointData(
+            id=point_id,
+            x1=float(x1) if not (np.isnan(x1) or np.isinf(x1)) else 0.0,
+            x2=float(x2) if not (np.isnan(x2) or np.isinf(x2)) else 0.0,
+            features=clean_features,
+            true_label=true_label,
+            base_model_prediction=EvaluatedPointPrediction(
+                pred_label=int(base_labels[0]),
+                pred_prob=base_prob
+            ),
+            mitigated_model_prediction=EvaluatedPointPrediction(
+                pred_label=int(mit_labels[0]),
+                pred_prob=mit_prob
+            )
+        )
+        
+    except Exception as e:
+        logger.error(f"Error evaluating point: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
 
-    base_labels, base_probs = get_predictions(input_features_df)
-    miti_labels, miti_probs = simulate_mitigated_predictions(base_labels, base_probs, input_features_df.copy())
+@app.get("/api/features")
+async def get_features():
+    """Get feature statistics and distributions."""
+    if not context.is_initialized:
+        raise HTTPException(status_code=400, detail="Context not initialized.")
+    
+    try:
+        features_list = []
+        
+        for col in context.feature_columns:
+            if col in context.numerical_features:
+                
+                series = context.dataset_df[col]
+                series_clean = series.dropna() 
+                
+                if len(series_clean) == 0:
+                    continue 
+                
+               
+                hist, bins = np.histogram(series_clean, bins=10)
+                histogram = []
+                for i in range(len(hist)):
+                    bin_label = f"{bins[i]:.1f}-{bins[i+1]:.1f}"
+                    histogram.append({"bin": bin_label, "value": int(hist[i])})
+                
+               
+                mean_val = float(series_clean.mean()) if not series_clean.empty else 0.0
+                min_val = float(series_clean.min()) if not series_clean.empty else 0.0
+                max_val = float(series_clean.max()) if not series_clean.empty else 0.0
+                median_val = float(series_clean.median()) if not series_clean.empty else 0.0
+                std_val = float(series_clean.std()) if not series_clean.empty else 0.0
+                
+                
+                if np.isnan(mean_val) or np.isinf(mean_val): mean_val = 0.0
+                if np.isnan(min_val) or np.isinf(min_val): min_val = 0.0
+                if np.isnan(max_val) or np.isinf(max_val): max_val = 0.0
+                if np.isnan(median_val) or np.isinf(median_val): median_val = 0.0
+                if np.isnan(std_val) or np.isinf(std_val): std_val = 0.0
+                
+                feature_stats = FeatureStats(
+                    featureName=col,
+                    count=int(series_clean.count()),
+                    missing=int(series.isna().sum()),
+                    mean=mean_val,
+                    min=min_val,
+                    max=max_val,
+                    median=median_val,
+                    std=std_val,
+                    histogram=histogram
+                )
+                features_list.append(feature_stats)
+        
+        return {"features": features_list}
+        
+    except Exception as e:
+        logger.error(f"Error getting features: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
 
-    response_features_model = StandardFeaturesModel(**features_for_df_dict)
-
-    return EvaluatedPointData(
-        id=point_id, x1=payload.x1, x2=payload.x2, features=response_features_model,
-        true_label=true_label,
-        base_model_prediction=EvaluatedPointPrediction(pred_label=int(base_labels[0]), pred_prob=float(base_probs[0])),
-        mitigated_model_prediction=EvaluatedPointPrediction(pred_label=int(miti_labels[0]), pred_prob=float(miti_probs[0]))
-    )
+@app.get("/api/performance_fairness")
+async def get_performance_fairness():
+    """Get performance and fairness metrics."""
+    if not context.is_initialized:
+        raise HTTPException(status_code=400, detail="Context not initialized.")
+    
+    try:
+        
+        base_labels, base_probs = get_predictions(context.base_model, context.X_test)
+        
+        
+        fpr, tpr, _ = roc_curve(context.y_test, base_probs)
+        precision, recall, _ = precision_recall_curve(context.y_test, base_probs)
+        cm = confusion_matrix(context.y_test, base_labels)
+        
+        
+        statistical_parity_diff = 0.0
+        disparate_impact = 1.0
+        equal_opportunity_diff = 0.0
+        
+        if context.sensitive_feature in context.X_test.columns:
+            
+            sensitive_groups = context.X_test[context.sensitive_feature].dropna().unique()
+            if len(sensitive_groups) >= 2:
+                group_rates = []
+                for group in sensitive_groups[:2]:  
+                    mask = context.X_test[context.sensitive_feature] == group
+                    if mask.sum() > 0:  
+                        group_pred_rate = base_labels[mask].mean()
+                        group_rates.append(group_pred_rate)
+                
+                if len(group_rates) == 2:
+                    statistical_parity_diff = group_rates[0] - group_rates[1]
+                    disparate_impact = group_rates[0] / (group_rates[1] + 1e-10)
+                    
+                    
+                    if np.isnan(statistical_parity_diff) or np.isinf(statistical_parity_diff):
+                        statistical_parity_diff = 0.0
+                    if np.isnan(disparate_impact) or np.isinf(disparate_impact):
+                        disparate_impact = 1.0
+        
+        
+        roc_data = [{"fpr": float(f), "tpr": float(t)} for f, t in zip(fpr[::5], tpr[::5])]  # Downsample
+        pr_data = [{"recall": float(r), "precision": float(p)} for r, p in zip(recall[::5], precision[::5])]
+        
+        return {
+            "roc_curve": roc_data,
+            "pr_curve": pr_data,
+            "confusion_matrix": {
+                "tn": int(cm[0, 0]),
+                "fp": int(cm[0, 1]),
+                "fn": int(cm[1, 0]),
+                "tp": int(cm[1, 1])
+            },
+            "fairness_metrics": {
+                "StatisticalParityDiff": float(statistical_parity_diff),
+                "DisparateImpact": float(disparate_impact),
+                "EqualOpportunityDiff": float(equal_opportunity_diff)
+            },
+            "performance_metrics": {
+                "Accuracy": float((cm[0, 0] + cm[1, 1]) / cm.sum()),
+                "F1Score": float(2 * cm[1, 1] / (2 * cm[1, 1] + cm[0, 1] + cm[1, 0])),
+                "AUC": float(np.trapz(tpr, fpr))
+            }
+        }
+        
+    except Exception as e:
+        logger.error(f"Error getting performance metrics: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
 
 @app.get("/api/partial_dependence")
-async def get_partial_dependence(): return {"partial_dependence_data": []}
-@app.get("/api/performance_fairness")
-async def get_performance_fairness(): return { "roc_curve": [], "pr_curve": [], "confusion_matrix": {"tn": 0, "fp": 0, "fn": 0, "tp": 0}, "fairness_metrics": {"StatisticalParityDiff": 0, "DisparateImpact": 0, "EqualOpportunityDiff": 0}, "performance_metrics": {"Accuracy": 0, "F1Score": 0, "AUC": 0}}
-@app.get("/api/features")
-async def get_features(): return {"features": []}
+async def get_partial_dependence():
+    """Get partial dependence data."""
+    if not context.is_initialized:
+        raise HTTPException(status_code=400, detail="Context not initialized.")
+    
+    try:
+        
+        features_to_plot = [
+            context.feature_columns.index(context.x1_feature),
+            context.feature_columns.index(context.x2_feature)
+        ]
+        
+        
+        pd_results = partial_dependence(
+            context.base_model,
+            context.X_test.head(100), 
+            features=[features_to_plot[0]],
+            grid_resolution=20
+        )
+        
+        pd_data = []
+        
+        grid_values = pd_results.get('grid_values', pd_results.get('values', [None]))[0]
+        if grid_values is None:
+            raise ValueError("Could not find grid values in partial dependence results")
+            
+        for i, val in enumerate(grid_values):
+            pd_data.append({
+                "x": float(val),
+                "pd_x1": float(pd_results['average'][0][i]),
+                "pd_x2": 0.0  
+            })
+        
+        return {"partial_dependence_data": pd_data}
+        
+    except Exception as e:
+        logger.error(f"Error getting partial dependence: {str(e)}")
+
+        return {"partial_dependence_data": []}
