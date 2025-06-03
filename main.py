@@ -188,11 +188,11 @@ def train_base_model(X_train: pd.DataFrame, y_train: pd.Series,
                     preprocessor: Any) -> Pipeline:
     """Train base classifier."""
     if classifier_type.lower() == "logistic_regression":
-        classifier = LogisticRegression(random_state=42, max_iter=1000, **params)
+        classifier = LogisticRegression(random_state=34, max_iter=1000, **params)
     elif classifier_type.lower() == "decision_tree":
-        classifier = DecisionTreeClassifier(random_state=42, **params)
+        classifier = DecisionTreeClassifier(random_state=53, **params)
     elif classifier_type.lower() == "random_forest":
-        classifier = RandomForestClassifier(random_state=42, **params)
+        classifier = RandomForestClassifier(random_state=61, **params)
     else:
         raise ValueError(f"Unsupported classifier: {classifier_type}")
     
@@ -309,7 +309,7 @@ async def initialize_context(request: InitializeContextRequest):
         
         
         X_train, X_test, y_train, y_test = train_test_split(
-            X, y, test_size=0.2, random_state=42, stratify=y
+            X, y, test_size=0.2, random_state=11, stratify=y
         )
         
         context.X_train = X_train
@@ -371,7 +371,7 @@ async def get_all_datapoints():
     
     try:
         
-        sample_size = min(200, len(context.X_test))
+        sample_size = min(50, len(context.X_test))
         sample_indices = np.random.choice(context.X_test.index, size=sample_size, replace=False)
         
         X_sample = context.X_test.loc[sample_indices]
