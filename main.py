@@ -91,6 +91,14 @@ def simulate_mitigated_predictions(base_labels: np.ndarray, base_probs: np.ndarr
 
 app = FastAPI(title="Beespector API")
 
+app.add_middleware(
+    CORSMiddleware, 
+    allow_origins=["http://localhost:3000", "http://localhost:3001", "http://127.0.0.1:3000", "http://127.0.0.1:3001"], 
+    allow_credentials=True, 
+    allow_methods=["*"], 
+    allow_headers=["*"]
+)
+
 @app.on_event("startup")
 async def startup_event():
     global dataset_df, model_pipeline, model_columns_info, initial_datapoints_cache
@@ -166,8 +174,6 @@ async def startup_event():
             ))
         print(f"Initial cache populated with {len(initial_datapoints_cache)} points.")
     except Exception as e: print(f"FATAL STARTUP ERROR: {e}"); import traceback; traceback.print_exc()
-
-app.add_middleware(CORSMiddleware, allow_origins=["http://localhost:3000", "http://127.0.0.1:3000"], allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
 
 @app.get("/api/datapoints", response_model=Dict[str, List[InitialDataPoint]])
 async def get_all_datapoints():
