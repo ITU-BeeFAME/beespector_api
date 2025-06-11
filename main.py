@@ -4,9 +4,13 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 import pandas as pd
 import numpy as np
+import os
+import cloudpickle
+import logging
+import hashlib
+import json
 from sklearn.model_selection import train_test_split
-from sklearn.impute import SimpleImputer
-from sklearn.preprocessing import StandardScaler, OneHotEncoder
+from sklearn.preprocessing import StandardScaler, OneHotEncoder, OrdinalEncoder
 from sklearn.compose import ColumnTransformer
 from sklearn.pipeline import Pipeline
 from sklearn.linear_model import LogisticRegression
@@ -16,7 +20,7 @@ from xgboost import XGBClassifier
 from sklearn.metrics import roc_curve, precision_recall_curve, confusion_matrix, roc_auc_score, f1_score, accuracy_score
 from sklearn.inspection import partial_dependence
 from ucimlrepo import fetch_ucirepo
-import logging
+from sklearn.impute import SimpleImputer
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -33,10 +37,14 @@ class InitializeContextRequest(BaseModel):
 class InitialDataPoint(BaseModel):
     id: int; x1: float; x2: float; true_label: int; features: Dict[str, Any]
     pred_label: int; pred_prob: float; mitigated_pred_label: int; mitigated_pred_prob: float
-class EvaluatedPointPrediction(BaseModel): pred_label: int; pred_prob: float
+
+class EvaluatedPointPrediction(BaseModel):
+    pred_label: int; pred_prob: float
+
 class EvaluatedPointData(BaseModel):
     id: int; x1: float; x2: float; features: Dict[str, Any]; true_label: int
     base_model_prediction: EvaluatedPointPrediction; mitigated_model_prediction: EvaluatedPointPrediction
+
 class FeatureStats(BaseModel):
     featureName: str; count: int; missing: int; mean: float; min: float; max: float
     median: float; std: float; histogram: List[Dict[str, Any]]
@@ -58,8 +66,8 @@ class BeespectorContext:
         self.dataset_name: str = ""
         self.base_classifier_type: str = ""
         self.mitigation_method: str = ""
-        self.sensitive_feature_conceptual: str = "" # e.g., 'age'
-        self.sensitive_feature_actual: str = ""     # e.g., 'attribute13'
+        self.sensitive_feature_conceptual: str = ""
+        self.sensitive_feature_actual: str = ""
         self.x1_feature: str = ""
         self.x2_feature: str = ""
         self.preprocessor: Optional[Any] = None
@@ -68,6 +76,10 @@ class BeespectorContext:
 context = BeespectorContext()
 app = FastAPI(title="Beespector API")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
+
+CACHE_DIR = "model_cache"
+os.makedirs(CACHE_DIR, exist_ok=True)
+
 
 # --- Helper Functions ---
 
@@ -99,50 +111,61 @@ def get_feature_types(df: pd.DataFrame) -> Tuple[List[str], List[str]]:
     logger.info(f"Numerical features: {numerical}"); logger.info(f"Categorical features: {categorical}")
     return categorical, numerical
 
-def create_preprocessor(cat_feats: List[str], num_feats: List[str]):
-    num_pipe = Pipeline([('imputer', SimpleImputer(strategy='median')), ('scaler', StandardScaler())])
-    cat_pipe = Pipeline([('imputer', SimpleImputer(strategy='most_frequent')), ('onehot', OneHotEncoder(handle_unknown='ignore', sparse_output=False))])
-    return ColumnTransformer(transformers=[('num', num_pipe, num_feats), ('cat', cat_pipe, cat_feats)], remainder='passthrough')
+def create_preprocessor(cat_feats: List[str], num_feats: List[str], dataset_name: str):
+    ordinal_features = []
+    ordinal_categories = []
+    if dataset_name == 'german':
+        german_ordinal_map = {
+            'attribute3': ['A34', 'A33', 'A32', 'A31', 'A30'],
+            'attribute6': ['A65', 'A61', 'A62', 'A63', 'A64'],
+            'attribute7': ['A71', 'A72', 'A73', 'A74', 'A75']
+        }
+        for feature in list(cat_feats):
+            if feature in german_ordinal_map:
+                ordinal_features.append(feature)
+                ordinal_categories.append(german_ordinal_map[feature])
+                cat_feats.remove(feature)
+    
+    numerical_pipeline = Pipeline([('imputer', SimpleImputer(strategy='median')), ('scaler', StandardScaler())])
+    categorical_pipeline = Pipeline([('imputer', SimpleImputer(strategy='most_frequent')), ('onehot', OneHotEncoder(handle_unknown='ignore', sparse_output=False))])
+    ordinal_pipeline = Pipeline([
+        ('imputer', SimpleImputer(strategy='most_frequent')),
+        ('ordinal', OrdinalEncoder(categories=ordinal_categories)),
+        ('scaler', StandardScaler())
+    ])
+    return ColumnTransformer(
+        transformers=[
+            ('num', numerical_pipeline, num_feats),
+            ('cat', categorical_pipeline, cat_feats),
+            ('ord', ordinal_pipeline, ordinal_features)
+        ],
+        remainder='passthrough'
+    )
 
 def train_model(X_train: pd.DataFrame, y_train: pd.Series, classifier_type: str, params: Dict[str, Any], preprocessor: Any, sample_weight: Optional[np.ndarray] = None) -> Pipeline:
-    
     clf_map = {
-        'xgbclassifier': XGBClassifier,
-        'random_forest': RandomForestClassifier,
-        'random_forest_classifier': RandomForestClassifier, # Alias
-        'svc': SVC,
-        'support_vector_classification': SVC, # Alias
-        'logistic_regression': LogisticRegression
+        'xgbclassifier': XGBClassifier, 'random_forest': RandomForestClassifier, 'random_forest_classifier': RandomForestClassifier,
+        'svc': SVC, 'support_vector_classification': SVC, 'logistic_regression': LogisticRegression
     }
-    
-    # Standardize the incoming name
     clf_key = classifier_type.lower().replace(' ', '_').replace('_(svc)', '')
-    
     if clf_key not in clf_map: raise ValueError(f"Unsupported classifier: {classifier_type}")
-    
     ClassifierClass = clf_map[clf_key]
-    
-    default_params = {'random_state': 42}
-    if clf_key == 'xgbclassifier': default_params.update({'use_label_encoder': False, 'eval_metric': 'logloss'})
-    elif 'svc' in clf_key or 'support_vector_classification' in clf_key:
+    default_params = {'random_state': None}
+    if 'svc' in clf_key or 'support_vector_classification' in clf_key:
         default_params.update({'probability': True})
-
     final_params = {**default_params, **{k: v for k, v in params.items() if v is not None and v != ''}}
     classifier = ClassifierClass(**final_params)
     logger.info(f"Creating classifier {ClassifierClass.__name__} with params: {final_params}")
-    
     pipeline = Pipeline([('preprocessor', preprocessor), ('classifier', classifier)])
-    
     if sample_weight is not None:
         try:
             pipeline.fit(X_train, y_train, classifier__sample_weight=sample_weight)
-            logger.info(f"Successfully fitted model with sample weights.")
+            logger.info("Successfully fitted model with sample weights.")
         except TypeError:
             logger.warning(f"Classifier {clf_key} doesn't support sample weights. Fitting without them.")
             pipeline.fit(X_train, y_train)
     else:
         pipeline.fit(X_train, y_train)
-        
     return pipeline
 
 def get_mitigation_weights(X_train: pd.DataFrame, y_train: pd.Series, sensitive_col: str):
@@ -165,7 +188,6 @@ def get_mitigation_weights(X_train: pd.DataFrame, y_train: pd.Series, sensitive_
             logger.info(f"Applying weight factor {weight_factor:.2f} to group '{group_val}'")
     return weights
 
-# --- API Endpoints ---
 @app.post("/api/initialize_context")
 async def initialize_context_endpoint(request: InitializeContextRequest):
     global context
@@ -177,40 +199,81 @@ async def initialize_context_endpoint(request: InitializeContextRequest):
         context.dataset_df = df
         if df['target'].nunique() < 2:
             raise ValueError(f"Dataset '{context.dataset_name}' loaded with only one class.")
-        context.target_column = 'target'
-        context.feature_columns = [c for c in df.columns if c not in ['target', 'id']]
-        if context.dataset_name == "adult":
-            context.x1_feature, context.x2_feature, age_col, sex_col = "age", "hours_per_week", "age", "sex"
-        elif context.dataset_name == "german":
-            context.x1_feature, context.x2_feature, age_col, sex_col = "attribute13", "attribute5", "attribute13", "sex"
-        context.sensitive_feature_conceptual = request.sensitive_feature
-        if request.sensitive_feature == 'age': context.sensitive_feature_actual = age_col
-        elif request.sensitive_feature == 'sex': context.sensitive_feature_actual = sex_col
-        else: context.sensitive_feature_actual = request.sensitive_feature
-        X, y = df[context.feature_columns], df[context.target_column]
-        context.X_train, context.X_test, context.y_train, context.y_test = train_test_split(X, y, test_size=0.2, random_state=42, stratify=y)
-        context.categorical_features, context.numerical_features = get_feature_types(df)
-        context.preprocessor = create_preprocessor(context.categorical_features, context.numerical_features)
-        context.base_classifier_type = request.base_classifier
-        context.base_model = train_model(context.X_train, context.y_train, request.base_classifier, request.classifier_params, context.preprocessor)
-        context.mitigation_method = request.mitigation_method
-        if context.mitigation_method.lower() != 'none':
-            weights = get_mitigation_weights(context.X_train, context.y_train, context.sensitive_feature_actual)
-            context.mitigated_model = train_model(context.X_train, context.y_train, request.base_classifier, request.classifier_params, context.preprocessor, sample_weight=weights)
+
+        clf_key = request.base_classifier.lower().replace(' ', '_').replace('_(svc)', '')
+        is_svc_scenario = "svc" in clf_key or "support_vector_classification" in clf_key
+        
+        if context.dataset_name == "adult" and is_svc_scenario:
+            logger.warning("Adult+SVC scenario detected. Loading pre-trained models.")
+            
+            base_model_path = os.path.join(CACHE_DIR, "pretrained_adult_svc_default.pkl")
+            if not os.path.exists(base_model_path):
+                raise HTTPException(status_code=501, detail="Base pre-trained model not found. Please run pretrain_svc.py.")
+            with open(base_model_path, 'rb') as f:
+                context.base_model = cloudpickle.load(f)
+            logger.info("Loaded pre-trained BASE model.")
+
+            mitigation_method_key = request.mitigation_method.lower().replace(' ', '_')
+            if mitigation_method_key == 'none':
+                context.mitigated_model = context.base_model
+                logger.info("No mitigation selected, using base model as mitigated model.")
+            else:
+                mitigated_model_path = os.path.join(CACHE_DIR, f"mitigated_adult_svc_{mitigation_method_key}.pkl")
+                if not os.path.exists(mitigated_model_path):
+                     raise HTTPException(status_code=501, detail=f"Required pre-trained mitigated model for '{mitigation_method_key}' not found. Please run pretrain_svc.py.")
+                with open(mitigated_model_path, 'rb') as f:
+                    context.mitigated_model = cloudpickle.load(f)
+                logger.info(f"Loaded pre-trained MITIGATED model for '{mitigation_method_key}'.")
+            
+            context.is_initialized = True
+            context.base_classifier_type = request.base_classifier
+            context.mitigation_method = request.mitigation_method
+            context.feature_columns = [c for c in df.columns if c not in ['target', 'id']]
+            context.x1_feature, context.x2_feature = "age", "hours_per_week"
+            _, context.X_test, _, context.y_test = train_test_split(df[context.feature_columns], df['target'], test_size=0.2, random_state=None)
+
         else:
-            context.mitigated_model = context.base_model
-        context.is_initialized = True
-        return {"status": "success", "message": "Context initialized", "dataset": context.dataset_name, "base_classifier": context.base_classifier_type, "mitigation_method": context.mitigation_method, "n_samples": len(df)}
+            logger.info("Training live model...")
+            context.target_column = 'target'
+            context.feature_columns = [c for c in df.columns if c not in ['target', 'id']]
+            if context.dataset_name == "adult":
+                context.x1_feature, context.x2_feature, age_col, sex_col = "age", "hours_per_week", "age", "sex"
+            elif context.dataset_name == "german":
+                context.x1_feature, context.x2_feature, age_col, sex_col = "attribute13", "attribute5", "attribute13", "sex"
+            
+            context.sensitive_feature_conceptual = request.sensitive_feature
+            if request.sensitive_feature == 'age': context.sensitive_feature_actual = age_col
+            elif request.sensitive_feature == 'sex': context.sensitive_feature_actual = sex_col
+            else: context.sensitive_feature_actual = request.sensitive_feature
+            
+            X, y = df[context.feature_columns], df[context.target_column]
+            context.X_train, context.X_test, context.y_train, context.y_test = train_test_split(X, y, test_size=0.2, random_state=None, stratify=y)
+            context.categorical_features, context.numerical_features = get_feature_types(df)
+            context.preprocessor = create_preprocessor(context.categorical_features, context.numerical_features, context.dataset_name)
+            
+            context.base_classifier_type = request.base_classifier
+            context.mitigation_method = request.mitigation_method
+            
+            context.base_model = train_model(context.X_train, context.y_train, request.base_classifier, request.classifier_params, context.preprocessor)
+            
+            if context.mitigation_method.lower() != 'none':
+                weights = get_mitigation_weights(context.X_train, context.y_train, context.sensitive_feature_actual)
+                context.mitigated_model = train_model(context.X_train, context.y_train, request.base_classifier, request.classifier_params, context.preprocessor, sample_weight=weights)
+            else:
+                context.mitigated_model = context.base_model
+            context.is_initialized = True
+        
+        return {"status": "success", "message": "Context initialized", "dataset": context.dataset_name, "base_classifier": request.base_classifier, "mitigation_method": request.mitigation_method, "n_samples": len(df)}
+
     except Exception as e:
         logger.error(f"Error initializing context: {str(e)}", exc_info=True)
         raise HTTPException(status_code=500, detail=f"An internal error occurred: {str(e)}")
 
-
 @app.get("/api/datapoints", response_model=Dict[str, List[InitialDataPoint]])
 async def get_all_datapoints():
     if not context.is_initialized: raise HTTPException(status_code=400, detail="Context not initialized.")
-    np.random.seed(42)
-    X_sample = context.X_test.sample(n=min(100, len(context.X_test)), random_state=42)
+    np.random.seed(None)
+    X_sample = context.X_test.sample(n=min(100, len(context.X_test)), random_state=None)
     y_sample = context.y_test.loc[X_sample.index]
     
     base_labels, base_probs = context.base_model.predict(X_sample), context.base_model.predict_proba(X_sample)[:, 1]
@@ -218,7 +281,6 @@ async def get_all_datapoints():
     
     datapoints = []
     for i, (idx, row) in enumerate(X_sample.iterrows()):
-        #Ensure values are not None before float conversion
         x1_val = row.get(context.x1_feature)
         x2_val = row.get(context.x2_feature)
         datapoints.append(InitialDataPoint(
@@ -270,7 +332,10 @@ async def evaluate_modified_point(point_id: int, payload: Dict[str, Any]):
 async def get_features():
     if not context.is_initialized: raise HTTPException(status_code=400, detail="Context not initialized.")
     features_list = []
-    for col in context.numerical_features:
+    # Use a copy to avoid errors if context changes during iteration
+    numerical_features = list(context.numerical_features) if hasattr(context, 'numerical_features') else []
+    for col in numerical_features:
+        if col not in context.dataset_df.columns: continue
         series = context.dataset_df[col].dropna().astype(float)
         if len(series) == 0: continue
         hist, bins = np.histogram(series, bins=10)
@@ -292,15 +357,20 @@ async def get_performance_fairness():
     precision, recall, _ = precision_recall_curve(y_true, base_probs)
     cm = confusion_matrix(y_true, base_labels)
     stat_parity, disparate_impact, eq_opp = 0.0, 1.0, 0.0
-    sensitive_col = context.X_test[context.sensitive_feature_actual]
-    groups = sensitive_col.dropna().unique()
-    if len(groups) >= 2:
-        g1_mask, g2_mask = (sensitive_col == groups[0]), (sensitive_col == groups[1])
-        p_g1, p_g2 = base_labels[g1_mask].mean(), base_labels[g2_mask].mean()
-        stat_parity = p_g1 - p_g2
-        disparate_impact = p_g1 / (p_g2 + 1e-6)
-        tpr_g1, tpr_g2 = base_labels[(g1_mask) & (y_true == 1)].mean(), base_labels[(g2_mask) & (y_true == 1)].mean()
-        eq_opp = tpr_g1 - tpr_g2
+    
+    # Use sensitive_feature_actual if available, otherwise fall back
+    sensitive_col_name = getattr(context, 'sensitive_feature_actual', None)
+    if sensitive_col_name and sensitive_col_name in context.X_test.columns:
+        sensitive_col = context.X_test[sensitive_col_name]
+        groups = sensitive_col.dropna().unique()
+        if len(groups) >= 2:
+            g1_mask, g2_mask = (sensitive_col == groups[0]), (sensitive_col == groups[1])
+            p_g1, p_g2 = base_labels[g1_mask].mean(), base_labels[g2_mask].mean()
+            stat_parity = p_g1 - p_g2
+            disparate_impact = p_g1 / (p_g2 + 1e-6)
+            tpr_g1, tpr_g2 = base_labels[(g1_mask) & (y_true == 1)].mean(), base_labels[(g2_mask) & (y_true == 1)].mean()
+            eq_opp = tpr_g1 - tpr_g2
+
     return {
         "roc_curve": [{"fpr": f, "tpr": t} for f, t in zip(fpr, tpr)],
         "pr_curve": [{"recall": r, "precision": p} for r, p in zip(recall, precision)],
@@ -312,10 +382,11 @@ async def get_performance_fairness():
 @app.get("/api/partial_dependence")
 async def get_partial_dependence():
     if not context.is_initialized: raise HTTPException(status_code=400, detail="Context not initialized.")
-    X_sample = context.X_test.sample(n=min(200, len(context.X_test)), random_state=42)
+    X_sample = context.X_test.sample(n=min(200, len(context.X_test)), random_state=None)
     features_to_plot = [context.x1_feature, context.x2_feature]
     pd_results = {}
     for feature_name in features_to_plot:
+        if not feature_name or feature_name not in X_sample.columns: continue
         try:
             base_pd = partial_dependence(context.base_model, X_sample, features=[feature_name], grid_resolution=20)
             mitigated_pd = partial_dependence(context.mitigated_model, X_sample, features=[feature_name], grid_resolution=20)
