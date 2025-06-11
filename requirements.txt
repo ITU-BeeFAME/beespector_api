@@ -1,6 +1,7 @@
 annotated-types==0.7.0
 anyio==3.7.1
 click==8.2.0
+cloudpickle==3.1.1
 colorama==0.4.6
 fastapi==0.104.1
 h11==0.16.0
@@ -26,6 +27,7 @@ typing-inspection==0.4.0
 typing_extensions==4.13.2
 tzdata==2025.2
 ucimlrepo==0.0.3
-uvicorn[standard]==0.24.0
+uvicorn==0.24.0
 watchfiles==1.0.5
 websockets==15.0.1
+xgboost==2.0.3
