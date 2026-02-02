@@ -15,8 +15,8 @@ RUN pip install --no-cache-dir -r requirements.txt
 COPY . .
 
 # 6. Expose the port that the application runs on inside the container.
-EXPOSE 8000
+EXPOSE 8001
 
 # 7. The command to run your application when the container starts.
 # --host 0.0.0.0 is essential to make it accessible from outside the container.
-CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000"]
+CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8001"]

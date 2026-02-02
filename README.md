@@ -31,9 +31,9 @@
 With the virtual environment activated, run the Uvicorn server from the root of the `beespector_api` directory:
 
 ```bash
-uvicorn main:app --reload --port 8000
+uvicorn main:app --reload --port 8001
 
-The API will be available at http://127.0.0.1:8000.
+The API will be available at http://127.0.0.1:8001.
 Interactive documentation (Swagger UI) can be found at http://127.0.0.1:8000/docs.
 API Endpoints
 GET /api/datapoints: Retrieves initial data points with base and mitigated model predictions.
@@ -41,3 +41,10 @@ PUT /api/datapoints/{point_id}/evaluate: Accepts modified features for a point a
 GET /api/features: (Placeholder) To retrieve feature statistics.
 GET /api/performance_fairness: (Placeholder) To retrieve model performance and fairness metrics.
 GET /api/partial_dependence: (Placeholder) To retrieve partial dependence plot data.
+```
+
+## Running the API with Docker (latest)
+docker build -t beespector-api:latest .
+docker run --rm -p 8001:8001 beespector-api:latest
+
+Then, check endpoints on http://localhost:8001/docs
